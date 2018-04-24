@@ -5,130 +5,78 @@ Created on Tue Dec 19 10:31:24 2017
 @author: jkunert
 """
 import numpy as np
-from DMD import DMD
-import matplotlib as mpl
-import matplotlib.pyplot as plt
-import os,time,sys
 import h5py
-import scipy as sci
-import scipy.spatial.distance as ssd
-import parseCIFTI as pC
-from glob import glob
-import h5py
-import copy
+import nibabel as nib
 
+def loadGrayord(fname,norm=True):
+    img=nib.load(fname);data=img.get_data()
+    data=data[0,0,0,0,:,:].T
+    if norm:
+        data=(data-np.mean(data,1)[:,None])/np.std(data,1)[:,None]
+    return data
 
-def catImgs(f1,f2,fout,xshift=0):
-    from PIL import Image
-    im=map(Image.open,[f1,f2])
-    w,h=zip(*(i.size for i in im))
-    tw=sum(w)-xshift
-    th=max(h)
-    imout=Image.new('RGB',(tw,th))
-    imout.paste(im[1],(im[0].size[0]-xshift,0))
-    imout.paste(im[0],(0,0))
-    imout.save(fout)
-
-def bin2img(f,nzf,nb=40):
-    A=np.zeros((nb*2,nb*2))
-    A[nzf]=f
-    return A
-
-def sbinMode(phi,nb=40):
-    #Function to bin cortex data spatially
-    L,R,X,Lz,Rz=pC.grayord2surf(phi)
-    Li=np.vstack([np.digitize(x,bins=np.linspace(np.min(x),np.max(x),nb),right=True) for x in L[:,:2].T]).T
-    Ri=np.vstack([np.digitize(x,bins=np.linspace(np.min(x),np.max(x),nb),right=True) for x in R[:,:2].T]).T
-
-    ###LEFT CORTEX    
-    p=np.absolute(L[:,-1:])
-    #Left exterior
-    LF=np.zeros((nb,nb))
-    LB=np.zeros((nb,nb))
-    for n,ij in enumerate(Li):
-        if Lz[n]<-29:
-            if LF[ij[0],ij[1]]<p[n]:
-                LF[ij[0],ij[1]]=p[n]
-        else:
-            if LB[ij[0],ij[1]]<p[n]:
-                LB[ij[0],ij[1]]=p[n]
-    LF=LF.T
-    LF=np.fliplr(np.flipud(LF))
-    LB=LB.T
-    LB=np.flipud(LB)
-    
-    ###RIGHT CORTEX
-    p=np.absolute(R[:,-1:])
-    #Right exterior
-    RF=np.zeros((nb,nb))
-    RB=np.zeros((nb,nb))
-    for n,ij in enumerate(Ri):
-        if Rz[n]<45:
-            if RF[ij[0],ij[1]]<p[n]:
-                RF[ij[0],ij[1]]=p[n]
-        else:
-            if RB[ij[0],ij[1]]<p[n]:
-                RB[ij[0],ij[1]]=p[n]
-    RF=RF.T
-    RF=np.flipud(RF)
-    RB=RB.T
-    RB=np.fliplr(np.flipud(RB))
-    
-    F=np.hstack([np.vstack([LF,LB]),np.vstack([RF,RB])])    
-    return F
-   
-def binCortexData(x,nb=40):
-    global R
+def generateBinIndices(nb=40):
     #load and sort data
-    L,R,_,_,_=pC.parseCoords()
-    nl=L.shape[0]
-    nr=R.shape[0]
-    xL=x[:nl,:]
-    xR=x[nl:(nl+nr),:]
+    with h5py.File('./grayordCoords.h5','r') as hf:
+      L=np.array(hf['L'])
+      R=np.array(hf['R'])
+    #split z-coordinates of grayords from x,y coordinates
     Lz=L[:,0];L=L[:,1:]
-    xL=xL[np.flipud(np.argsort(Lz)),:]
-    L=L[np.flipud(np.argsort(Lz)),:]
     Rz=R[:,0];R=R[:,1:]
-    xR=xR[np.argsort(Rz),:]
-    R=R[np.argsort(Rz),:]
-    Lz=np.flipud(np.sort(Lz))
-    Rz=np.sort(Rz)
-    
-    x=np.vstack((xL,xR))    
-    
+    #for both x,y coordinates on both left/right side, use np.digitize to assign coordinates into bins
+    #where bin boundaries are equally spaced between minimum and maximum values
     Li=np.vstack([np.digitize(bx,bins=np.linspace(np.min(bx),np.max(bx),nb),right=True) for bx in L[:,:2].T]).T
     Ri=np.vstack([np.digitize(bx,bins=np.linspace(np.min(bx),np.max(bx),nb),right=True) for bx in R[:,:2].T]).T
     
-    LR=np.zeros((x.shape[0],1))
-    LR[:nl]=1.0
+    #create index array giving [L/R?,medial?,x_bin,y_bin] for each grayordinate
+    #the last two columns (the bin coordinates) come from stacking Li,Ri on top of each other
+    #so the "L/R"? label (0=Left,1=Right) 
+    LR=np.zeros((L.shape[0]+R.shape[0],1))
+    LR[:L.shape[0]]=1.0
+    #by eye, the division between medial/lateral grayordinates is at about z=+/-29
     medial=np.hstack(((Lz>-29),(Rz<29)))
     
-    #create index array giving [LR,medial?,x,y] bin coordinate of each voxel in x
+    #combine into index array = [L/R?,medial?,x_bin,y_bin]
     IJK=np.vstack((Li,Ri))
     IJK=np.hstack((LR,medial[:,None],IJK))
+    #generate a single index which encodes all four columns
     IJK=IJK.dot(np.array([[nb**3.0],[nb**2.0],[nb],[1]]))
-    R,J=np.unique(IJK,return_inverse=True)
-    R=R.astype(int)
-    #create sparse binning matrix of size (no. unique bins)x(original no. surface voxels)
-    #multiplying with 'x' averages data within each bin
+    #find unique values of the bin index, each of which uniquely corresponds to a bin with a
+    #particular L/R, medial/lateral label and (x,y) bin coordinate
+    #'binIndices' gives the bin index for each bin
+    #'J' gives the bin number for each grayordinate
+    binIndices,J=np.unique(IJK,return_inverse=True)
+    binIndices=binIndices.astype(int)
+    return binIndices,J
+
+def binCortexData(x,nb=40):
     import scipy.sparse as sparse
+    #create sparse binning matrix of size (no. unique bins)x(original no. surface voxels)
+    binIndices,J=generateBinIndices(nb=nb)
     binner=sparse.coo_matrix((np.ones((len(J),)),(J,np.arange(len(J)))),shape=(len(np.unique(J)),x.shape[0]))
     binner=sparse.diags(1.0/np.array(np.sum(binner,1)).ravel()).dot(binner)
-    
-    #average data across bins
+    #multiplying with 'x' averages data within each bin
     X=binner.dot(x)
     return X
     
     
-def flat2mat(f):
-    global R
-    nb=int(np.max(R**(1/3.0)))
-    Rit=R%nb
-    y=copy.copy(Rit)
-    x=((R-R%nb)/nb)%nb
-    med=((R-R%nb**2)/nb**2)%nb
-    LR=(R-R%nb**3)/nb**3
+def flat2mat(f,nb=40):
+    f=f.ravel()
+    #get bin indices
+    binIndices,_=generateBinIndices(nb=nb)
+    ##test that nb is correct size
+    if len(binIndices)!=len(f):
+      raise Exception('Input vector length does not match number of bins for nb={:}. Check that argument "nb" for flat2mat matches "nb" used for initial binning.'.format(nb))      
+    #bin indices encode L/R label, medial label, and x/y coordinates of bin
+    #so extract these values:
+    y=binIndices%nb
+    x=((binIndices-binIndices%nb)/nb)%nb
+    med=((binIndices-binIndices%nb**2)/nb**2)%nb
+    LR=(binIndices-binIndices%nb**3)/nb**3
     
+    #for different combinations of L/R, medial/lateral,
+    #assign bin values to bin location in subarray
+    #flipping as necessary for correct visualization
     F00=np.zeros((nb,nb))
     fx=f[(LR==1)&(med==0)]
     ix=y[(LR==1)&(med==0)]
@@ -155,61 +103,50 @@ def flat2mat(f):
     ix=y[(LR==0)&(med==1)]
     jx=x[(LR==0)&(med==1)]
     F11[ix%nb,jx%nb]=fx
-    F11=np.fliplr(np.flipud(F11))  
-    F=np.vstack((np.hstack((F00,F01)),np.hstack((F10,F11))))   
+    F11=np.fliplr(np.flipud(F11))
+    
+    #stack subarrays into single array and return
+    F=np.vstack((np.hstack((F00,F01)),np.hstack((F10,F11))))
+    
     return F
     
 
 def mat2flat(F):
-    global R
-    nb=int(np.max(R**(1/3.0)))
-    Rit=R%nb
-    y=copy.copy(Rit)
-    x=((R-R%nb)/nb)%nb
-    med=((R-R%nb**2)/nb**2)%nb
-    LR=(R-R%nb**3)/nb**3
+    #infer nb from matrix shape
+    nb=F.shape[0]/2
+    #bin indices encode L/R label, medial label, and x/y coordinates of bin
+    #so again extract these values:
+    binIndices,_=generateBinIndices(nb=nb)
+    nb=int(np.max(binIndices**(1/3.0)))
+    y=binIndices%nb
+    x=((binIndices-binIndices%nb)/nb)%nb
+    med=((binIndices-binIndices%nb**2)/nb**2)%nb
+    LR=(binIndices-binIndices%nb**3)/nb**3
     
     f=[]
     
-    w=F.shape[0]/2
-    Fs=[np.flipud(np.fliplr(F[:w,:w])),np.flipud(F[:w,w:]),np.flipud(F[w:,:w]),np.flipud(np.fliplr(F[w:,w:]))]
+    #split apart and un-flip subarrays corresponding to different L/R, med/lat labels
+    Fs=[np.flipud(np.fliplr(F[:nb,:nb])),np.flipud(F[:nb,nb:]),np.flipud(F[nb:,:nb]),np.flipud(np.fliplr(F[nb:,nb:]))]
     n=0
     for medk in [0,1]:
         for lrk in [1,0]:
             Fij=Fs[n]
             n+=1
+            #get x,y coordinates of bins with matching labels
             ix=y[(LR==lrk)&(med==medk)]
             jx=x[(LR==lrk)&(med==medk)]
+            #extract bins at (ix,jx) coordinates into flattened array
             fx=Fij[ix,jx]
             f.append(fx)
- 
+    #combine flattened subarrays in the right order
     f=np.concatenate((f[1],f[3],f[0],f[2]))
     return f
-    
-    
-def vizSmoothMode(p):
-    P=flat2mat(p)
-    plt.figure(facecolor=(1,1,1))
-    plt.get_current_fig_manager().window.setGeometry(775,83,1130,932)
-    P[P==0]=np.nan
-    plt.imshow(np.abs(P),interpolation='None',cmap='coolwarm')
-    plt.colorbar()
-def loadModes(fdir='./results/binnedModes/'):
-    with h5py.File(fdir+'DMDmodes.h5','r') as hf:
-        Phi=np.array(hf['Phi'])
-        freq=np.array(hf['freq'])
-        power=np.array(hf['power'])
-        ux=np.array(hf['ux'])
-    with h5py.File(fdir+'BinnedModes.h5','r') as hf:
-        F=np.array(hf['F'])
-    return Phi,freq,power,ux,F
-    
-def loadSpatialClusters():
-    with h5py.File(fdir+'HClusters.h5','r') as hf:
-        C=np.array(hf['C'])
-        ix=np.array(hf['ix'])
-    return C,ix
+
   
-def initR():
-    binCortexData(np.ones((91282,1)))
-    return None
+if __name__=='__main__':
+  x=np.random.randn(59412,5)
+  nb=40
+  X=binCortexData(x)
+  F=flat2mat(X[:,0])
+  assert np.all(mat2flat(F)==X[:,0])
+  print "Utility functions: smoke test passed!"

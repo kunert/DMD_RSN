@@ -9,94 +9,75 @@ import numpy as np
 import copy
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+import h5py
 
-
-def combineDataList(Xl):
-    X=[]
-    Xp=[]
-    if type(Xl)==np.ndarray:
-        Xl=[Xl]
-    for Xk in Xl:
-        Xk+=-np.mean(Xk,1)[:,None]
-        Xpk=Xk[:,1:]
-        Xk=Xk[:,:-1]
-        X.append(Xk)
-        Xp.append(Xpk)
-    X=np.hstack(X)
-    Xp=np.hstack(Xp) 
-    return X,Xp
-
-def shiftstack(Xl):
-    SS=[]
-    if type(Xl)==np.ndarray:
-        Xl=[Xl]
-    for Xk in Xl:
-        SS.append(np.concatenate((Xk[:,:-1],Xk[:,1:]),0))
-    return SS
-
-def DMD(C,n=[],ploton=True,p=[],h=[]):
-    #inputs data matrix C -- rows are variables, columns are timepoints
-    # C can either be a numpy array or a list of numpy arrays
+def DMD(C,n=[],p=[],h=[]):
+    #inputs data array C -- rows are variables, columns are timepoints
     #optional inputs:
     #n = number of DMD modes to keep; if n=[] (default) then uses number of variables in C
-    Xl=copy.copy(C)
-    X,Xp=combineDataList(Xl)    
+    #p = if set and n==0, then uses first n modes to capture fraction 'p' of energy
+    #h = timestep between measurements, for calculating frequencies in Hz
+    #     (if h is unset, uses default of h=(14*60+33)/1200. for HCP data)
     
+    #split data matrix into two subarrays shifted by one timepoint
+    #such that X[:,i+1]=Xp[:,i]
+    X=copy.copy(C)
+    X+=-np.mean(X,1)[:,None]
+    Xp=X[:,1:]
+    X=X[:,:-1]
+
+    #compute SVD of data matrix
     U,S,V=np.linalg.svd(X,full_matrices=False)
     
-    #print np.cumsum(S)/np.sum(S)
-    
+
     if (n==[])&(p!=[]):
         n=np.where((np.cumsum(S)/np.sum(S))>=p)[0][0]+1
         print 'KEEPING {:} MODES TO CAPTURE {:} OF ENERGY'.format(n,p)
     if n==[]:
         n=X.shape[0]
+        
     Ut=U[:,:n]
     Sinv=np.diag(1./S[:n])
     Vt=V[:n].T
     
+    #compute reduced-dimensional representation of A-matrix
     Ap=(Ut.T).dot(Xp.dot(Vt.dot(Sinv)))
-    
+    #weight A by singular values
     Ah=np.diag(S[:n]**-0.5).dot(Ap.dot(np.diag(S[:n]**0.5)))
-    #Ap=Ap[:n,:][:,:n]
-    #Ah=Ap
+    #compute eigendecomposition of weighted A-matrix
     w,v=np.linalg.eig(Ah)
     v=np.diag(S[:n]**0.5).dot(v)
     
+    #compute DMD modes from eigenvectors
     Phi=Xp.dot(Vt.dot(Sinv.dot(v)))
-    
+    #computed this way, DMD modes are not normalized; norm gives power of mode in data
+    power=np.real(np.sum(Phi*Phi.conj(),0))
+     
     #HCP900 Data reference manual gives 1200 frames per run, 14:33 run duration.. gives approximate
     # seconds/frame as...
     if h==[]:
         h=(14*60+33)/1200.
-    
-    power=np.real(np.sum(Phi*Phi.conj(),0))
-    
+    #use h to convert complex eigenvalues into corresponding oscillation frequencies
     freq=np.angle(w)/(2*np.pi*h)
     
-    if ploton is True:
-        plt.figure(facecolor=(1,1,1))
-        plt.get_current_fig_manager().window.setGeometry(965,251,787,560)
-        plt.plot(freq[freq>=0],power[freq>=0],'.')
-        for k,f in enumerate(freq[freq>=0]):
-            plt.plot([f,f],[0,power[freq>=0][k]],c=(0,0,0))
-        plt.xlabel('Frequency (Hz)')
-        plt.ylabel('Power')
-        #plt.savefig('./atlasDMD'+str(n)+'.png')
-    return Phi,w,v,power,freq,Ap
+    return Phi,power,freq
     
     
 if __name__=='__main__':
-    pass
-    #C=parcellateData('./100408/tfMRI_RELATIONAL_LR.nii.gz')
-    #Phi,w,v,power,freq=DMD(shiftstack(shiftstack(C)),n=246)
-    """
-    phik,w,v,pt,ft=DMD(Xr[:,:20],p=1.0,ploton=False)
-    b=np.linalg.pinv(phik).dot(Xr[:,0][:,None])
+  with h5py.File('test_data.h5','r') as hf:
+    Xr=np.array(hf['Xr'])
+    P=np.array(hf['P'])
+    p=np.array(hf['p'])
+    f=np.array(hf['f'])
+  nmodes=3
+  for k,frame0 in enumerate([0,10]):
+    X=Xr[:,frame0:(frame0+50)]
+    phik,pt,ft=DMD(X,n=nmodes)
+    #check that we get same results as previous version of code
+    assert np.all(phik==P[k])
+    assert np.all(pt==p[k])
+    assert np.all(ft==f[k])
+  print 'Consistency test passed!'
 
-    tn=2
-
-    x0=np.real(phik.dot(b*np.exp(w*tn)[:,None]))
-    plt.cla()
-    plt.plot(x0,Xr[:,tn],'.')
-    """
+      
+    
